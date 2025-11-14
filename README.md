@@ -55,7 +55,7 @@
     | `config` | `key` (TEXT, PRIMARY KEY), `value` (TEXT) |
     | `messages` | `user_id` (TEXT), `message_id` (TEXT), `text` (TEXT), `date` (INTEGER), PRIMARY KEY (`user_id`, `message_id`) |
 
-    -- ① users 表
+-- ① users 表
 
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
