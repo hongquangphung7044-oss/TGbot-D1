@@ -16,8 +16,9 @@
  * [修复] 解决管理员在话题中编辑回复，用户收不到的问题。
  * [修复] 解决用户回答正确的验证答案时，该消息也被转发的问题。
  * [新增] 增强管理员编辑消息通知，包含旧内容、旧时间、新内容和新编辑时间，以镜像用户编辑通知。
- * * **【重要修复】**
- * **[修复] 话题删除后自动重建：在 handleRelayToTopic 捕获 message thread not found 错误，自动清除 D1 记录并创建新话题。**
+ * [修复] 减少配置列表点击后无响应的情况
+ * [修复] 修复话题自动重建时 'copyParams is not defined' 的作用域错误。
+ * [新增] 在用户资料卡下方增加“结束当前会话”快捷按钮。结束之后对方重启发起消息需要重新验证，防止广告绕过验证无法二次验证
  */
 
 
@@ -101,6 +102,37 @@ async function dbConfigGet(key, env) {
     const row = await env.TG_BOT_DB.prepare("SELECT user_id FROM users WHERE topic_id = ?").bind(topicId).first();
     return row ? row.user_id : null;
   }
+
+  // --- [新增功能] 管理员重置用户验证状态 D1 函数 ---
+  /**
+   * [D1 Abstraction] 通过话题 ID 查找用户并重置其状态，强制需要重新验证。
+   * 将 user_state 设为 "new"，并清除 topic_id。
+   * @param {string} topicId - 管理群组中的消息主题 ID (即用户的话题ID)。
+   * @param {Env} env - Cloudflare Worker 环境变量。
+   * @returns {Promise<string|null>} 返回被重置的 user_id，如果未找到则返回 null。
+   */
+  async function dbUserResetStateByTopicId(topicId, env) {
+      const db = env.TG_BOT_DB;
+  
+      // 1. 根据 topic_id 查找 user_id
+      const { results } = await db.prepare("SELECT user_id FROM users WHERE topic_id = ?")
+          .bind(topicId)
+          .all();
+  
+      if (results.length === 0) {
+          return null; // 找不到对应用户
+      }
+  
+      const userId = results[0].user_id;
+  
+      // 2. 重置用户的状态为初始状态（"new"）并清除 topic_id
+      await db.prepare("UPDATE users SET user_state = ?, topic_id = NULL WHERE user_id = ?")
+          .bind("new", userId) 
+          .run();
+  
+      return userId;
+  }
+  // --- [新增功能] 结束 ---
   
   /**
   * [D1 Abstraction] 存入消息数据 (messages table)
@@ -260,11 +292,11 @@ async function dbConfigGet(key, env) {
   }
   
   /**
-  * 生成用户资料卡下方的操作按钮（屏蔽/解禁/置顶）
+  * 生成用户资料卡下方的操作按钮（屏蔽/解禁/置顶/重置会话）
   */
   function getInfoCardButtons(userId, isBlocked) {
     const blockAction = isBlocked ? "unblock" : "block";
-    const blockText = isBlocked ? "✅ 解除屏蔽 (Unblock)" : "🚫 屏蔽此人 (Block)";
+    const blockText = isBlocked ? "✅ 解除屏蔽" : "🚫 屏蔽此人";
     return {
         inline_keyboard: [
             [{ // Row 1: Block/Unblock Button
@@ -272,8 +304,12 @@ async function dbConfigGet(key, env) {
                 callback_data: `${blockAction}:${userId}`
             }],
             [{ // Row 2: Pin Button
-                text: "📌 置顶此消息 (Pin Card)",
+                text: "📌 置顶此消息",
                 callback_data: `pin_card:${userId}` 
+            }],
+            [{ // Row 3: Reset Session Button (NEW)
+                text: "🔄 结束当前话题", 
+                callback_data: `reset_session:${userId}` 
             }]
         ]
     };
@@ -895,16 +931,20 @@ async function dbConfigGet(key, env) {
   <b>当前设置:</b>
   • 欢迎消息: ${escapeHtml(welcomeMsg).substring(0, 30)}...
   • 验证问题: ${escapeHtml(verifQ).substring(0, 30)}...
-  • 验证答案(答案可以是多个，用符合|进行隔断): <code>${escapeHtml(verifA)}</code>
+  • 验证答案: <code>${escapeHtml(verifA)}</code>
   
   请选择要修改的配置项:
     `.trim();
   
     const menuKeyboard = {
         inline_keyboard: [
-            [{ text: "📝 编辑欢迎消息", callback_data: "config:edit:welcome_msg" }],
-            [{ text: "❓ 编辑验证问题", callback_data: "config:edit:verif_q" }],
-            [{ text: "🔑 编辑验证答案", callback_data: "config:edit:verif_a" }],
+            // 第一行
+            [{ text: "✏️ 修改欢迎消息", callback_data: "config:edit:welcome_msg" }],
+            // 第二行
+            [{ text: "✏️ 修改验证问题", callback_data: "config:edit:verif_q" }],
+            // 第三行
+            [{ text: "✏️ 修改验证答案", callback_data: "config:edit:verif_a" }],
+            // 第四行
             [{ text: "⬅️ 返回主菜单", callback_data: "config:menu" }],
         ]
     };
@@ -928,15 +968,14 @@ async function dbConfigGet(key, env) {
   async function handleAdminAuthorizedConfigMenu(chatId, messageId, env) {
     const primaryAdmins = env.ADMIN_IDS ? env.ADMIN_IDS.split(',').map(id => id.trim()).filter(id => id !== "") : [];
     const authorizedAdmins = await getAuthorizedAdmins(env);
-    
     const allAdmins = [...new Set([...primaryAdmins, ...authorizedAdmins])]; // 合并并去重
     const authorizedCount = authorizedAdmins.length;
-  
+    
     const menuText = `
   🧑‍💻 <b>协管员授权设置</b>
   
   <b>主管理员 (来自 ENV):</b> <code>${primaryAdmins.join(', ')}</code>
-  <b>已授权协管员 (来自 D1):</b> <code>${authorizedAdmins.join(', ') || '无'}</code>
+  <b>已授权协管员 (来自 D1):</b> <code>${authorizedAdmins.join(', ')}</code>
   <b>总管理员/协管员数量:</b> ${allAdmins.length} 人
   
   <b>注意：</b>
@@ -969,88 +1008,13 @@ async function dbConfigGet(key, env) {
   }
   
   /**
-  * 自动回复子菜单 - 兼容编辑和发送新消息
-  */
-  async function handleAdminAutoReplyMenu(chatId, messageId, env) {
-    const rules = await getAutoReplyRules(env);
-    const ruleCount = rules.length;
-    
-    const menuText = `
-  🤖 <b>自动回复管理</b>
-  
-  当前规则总数：<b>${ruleCount}</b> 条。
-  
-  请选择操作：
-    `.trim();
-  
-    const menuKeyboard = {
-        inline_keyboard: [
-            [{ text: "➕ 新增自动回复规则", callback_data: "config:add:keyword_responses" }],
-            [{ text: `🗑️ 管理/删除现有规则 (${ruleCount}条)`, callback_data: "config:list:keyword_responses" }],
-            [{ text: "⬅️ 返回主菜单", callback_data: "config:menu" }],
-        ]
-    };
-  
-    const apiMethod = (messageId && messageId !== 0) ? "editMessageText" : "sendMessage";
-    const params = {
-        chat_id: chatId,
-        text: menuText,
-        parse_mode: "HTML",
-        reply_markup: menuKeyboard,
-    };
-    if (apiMethod === "editMessageText") {
-        params.message_id = messageId;
-    }
-    await telegramApi(env.BOT_TOKEN, apiMethod, params);
-  }
-  
-  /**
-  * 关键词屏蔽子菜单 - 兼容编辑和发送新消息
-  */
-  async function handleAdminKeywordBlockMenu(chatId, messageId, env) {
-    const blockKeywords = await getBlockKeywords(env);
-    const keywordCount = blockKeywords.length;
-    const blockThreshold = await getConfig('block_threshold', env, "5");
-  
-    const menuText = `
-  🚫 <b>关键词屏蔽管理</b>
-  
-  当前屏蔽关键词总数：<b>${keywordCount}</b> 个。
-  屏蔽次数阈值：<code>${escapeHtml(blockThreshold)}</code> 次。
-  
-  请选择操作：
-    `.trim();
-  
-    const menuKeyboard = {
-        inline_keyboard: [
-            [{ text: "➕ 新增屏蔽关键词", callback_data: "config:add:block_keywords" }],
-            [{ text: `🗑️ 管理/删除现有关键词 (${keywordCount}个)`, callback_data: "config:list:block_keywords" }],
-            [{ text: "✏️ 修改屏蔽次数阈值", callback_data: "config:edit:block_threshold" }],
-            [{ text: "⬅️ 返回主菜单", callback_data: "config:menu" }],
-        ]
-    };
-  
-    const apiMethod = (messageId && messageId !== 0) ? "editMessageText" : "sendMessage";
-    const params = {
-        chat_id: chatId,
-        text: menuText,
-        parse_mode: "HTML",
-        reply_markup: menuKeyboard,
-    };
-    if (apiMethod === "editMessageText") {
-        params.message_id = messageId;
-    }
-    await telegramApi(env.BOT_TOKEN, apiMethod, params);
-  }
-  
-  /**
   * [新增] 备份群组设置子菜单 - 兼容编辑和发送新消息
   */
   async function handleAdminBackupConfigMenu(chatId, messageId, env) {
     // 备份群组 ID 存储在 'backup_group_id' 键中
-    const backupGroupId = await getConfig('backup_group_id', env, "未设置"); 
+    const backupGroupId = await getConfig('backup_group_id', env, "未设置");
     const backupStatus = backupGroupId !== "未设置" && backupGroupId !== "" ? "✅ 已启用" : "❌ 未启用";
-  
+    
     const menuText = `
   💾 <b>备份群组设置</b>
   
@@ -1085,7 +1049,6 @@ async function dbConfigGet(key, env) {
     await telegramApi(env.BOT_TOKEN, apiMethod, params);
   }
   
-  
   /**
   * [新增] 规则列表和删除界面
   */
@@ -1093,70 +1056,69 @@ async function dbConfigGet(key, env) {
     let rules = [];
     let menuText = "";
     let backCallback = "";
-  
+    
     if (key === 'keyword_responses') {
         rules = await getAutoReplyRules(env);
-        menuText = `
-  🤖 <b>自动回复规则列表 (${rules.length}条)</b>
-  
-  请点击右侧按钮删除对应规则。
-  规则格式：<code>关键词表达式</code> ➡️ <code>回复内容</code>
-  ---
-        `.trim();
+        menuText = `🤖 <b>自动回复规则管理</b>\n\n当前规则列表（共 ${rules.length} 条）：`;
         backCallback = "config:menu:autoreply";
     } else if (key === 'block_keywords') {
         rules = await getBlockKeywords(env);
-        menuText = `
-  🚫 <b>关键词屏蔽列表 (${rules.length}个)</b>
-  
-  请点击右侧按钮删除对应关键词。
-  关键词格式：<code>关键词表达式</code>
-  ---
-        `.trim();
+        menuText = `🚫 <b>屏蔽关键词管理</b>\n\n当前关键词列表（共 ${rules.length} 条）：`;
         backCallback = "config:menu:keyword";
     } else {
         return;
     }
-  
-    const ruleButtons = [];
+    
+    let ruleButtons = [];
+    
     if (rules.length === 0) {
-        menuText += "\n\n<i>（列表为空）</i>";
+        menuText += "\n\n无。请添加新规则。";
     } else {
-        rules.forEach((rule, index) => {
-            let label = "";
-            let deleteId = "";
+        // 分页显示，这里简单显示前 10 个
+        rules.slice(0, 10).forEach((rule, index) => {
+            let ruleDisplay;
+            let ruleIdToDelete; // 用于 callback_data 的唯一标识
             
             if (key === 'keyword_responses') {
-                // 自动回复规则：使用 ID 进行删除
-                const keywordsSnippet = rule.keywords.substring(0, 15);
-                const responseSnippet = rule.response.substring(0, 20);
-                label = `${index + 1}. <code>${escapeHtml(keywordsSnippet)}...</code> ➡️ ${escapeHtml(responseSnippet)}...`;
-                deleteId = rule.id;
-            } else if (key === 'block_keywords') {
-                // 屏蔽关键词：直接使用关键词字符串作为 ID (确保唯一)
-                const keywordSnippet = rule.substring(0, 25);
-                label = `${index + 1}. <code>${escapeHtml(keywordSnippet)}...</code>`;
-                deleteId = rule; 
+                ruleDisplay = `[${index + 1}] ${rule.keywords.substring(0, 15)}... -> ${rule.response.substring(0, 15)}...`;
+                ruleIdToDelete = rule.id; // 使用时间戳 ID
+            } else { // block_keywords
+                ruleDisplay = `[${index + 1}] ${rule.substring(0, 30)}...`;
+                ruleIdToDelete = rule; // 使用关键词字符串作为 ID
             }
             
-            // 添加列表信息到文本
-            menuText += `\n${label}`;
-  
-            // 添加删除按钮
-            ruleButtons.push([
-                { 
-                    text: `🗑️ 删除 ${index + 1}`, 
-                    // config:delete:key:id
-                    callback_data: `config:delete:${key}:${deleteId}`
-                }
-            ]);
-  
+            ruleButtons.push([{ 
+                text: ruleDisplay, 
+                callback_data: "noop:0" // 不可点击或设置为占位符
+            }, {
+                text: "❌ 删除",
+                // 格式: rule:delete:{key}:{id/keyword}
+                callback_data: `rule:delete:${key}:${ruleIdToDelete}`
+            }]);
         });
+        
+        if (rules.length > 10) {
+            menuText += `\n\n（仅显示前 10 条，共 ${rules.length} 条）`;
+        }
     }
+    
+    // 顶部添加/返回按钮
+    let topButtons = [];
+    if (key === 'keyword_responses') {
+        topButtons.push({ text: "➕ 新增自动回复", callback_data: "config:edit:keyword_responses" });
+    } else {
+        topButtons.push({ text: "➕ 新增屏蔽关键词", callback_data: "config:edit:block_keywords" });
+        // 添加屏蔽计数阈值
+        const blockThreshold = await getConfig('block_threshold', env, "5");
+        menuText += `\n\n<b>自动屏蔽阈值:</b> <code>${blockThreshold}</code> (点击修改)`;
+        topButtons.push({ text: `⚙️ 修改屏蔽阈值 (${blockThreshold})`, callback_data: "config:edit:block_threshold" });
+    }
+    
+    ruleButtons.unshift(topButtons);
     
     // 底部返回按钮
     ruleButtons.push([{ text: "⬅️ 返回管理菜单", callback_data: backCallback }]);
-  
+    
     const apiMethod = (messageId && messageId !== 0) ? "editMessageText" : "sendMessage";
     const params = {
         chat_id: chatId,
@@ -1171,13 +1133,13 @@ async function dbConfigGet(key, env) {
   }
   
   /**
-   * [新增] 规则删除逻辑
-   */
+  * [新增] 规则删除逻辑
+  */
   async function handleAdminRuleDelete(chatId, messageId, callbackQueryId, env, key, id) {
     let rules = [];
     let typeName = "";
     let backCallback = "";
-  
+    
     if (key === 'keyword_responses') {
         rules = await getAutoReplyRules(env);
         typeName = "自动回复规则";
@@ -1198,10 +1160,10 @@ async function dbConfigGet(key, env) {
     await dbConfigPut(key, JSON.stringify(rules), env);
   
     // BUG FIX: 修复 callback_query_id 使用错误导致通知不显示的 Bug
-    await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", {
+    await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { 
         callback_query_id: callbackQueryId, // 使用正确的 callbackQueryId
-        text: `✅ ${typeName}已删除并更新。`,
-        show_alert: false
+        text: `✅ ${typeName}已删除并更新。`, 
+        show_alert: false 
     });
   
     // 刷新列表界面
@@ -1216,35 +1178,27 @@ async function dbConfigGet(key, env) {
     const mediaStatus = (await getConfig('enable_image_forwarding', env, 'true')).toLowerCase() === 'true'; // 图片/视频/文件
     const linkStatus = (await getConfig('enable_link_forwarding', env, 'true')).toLowerCase() === 'true';
     const textStatus = (await getConfig('enable_text_forwarding', env, 'true')).toLowerCase() === 'true';
-    const channelForwardStatus = (await getConfig('enable_channel_forwarding', env, 'true')).toLowerCase() === 'true'; // 频道转发
-    const anyForwardStatus = (await getConfig('enable_forward_forwarding', env, 'true')).toLowerCase() === 'true'; // 任何转发
-    const audioVoiceStatus = (await getConfig('enable_audio_forwarding', env, 'true')).toLowerCase() === 'true'; // 音频/语音
-    const stickerGifStatus = (await getConfig('enable_sticker_forwarding', env, 'true')).toLowerCase() === 'true'; // 贴纸/GIF
+    const channelForwardStatus = (await getConfig('enable_channel_forwarding', env, 'true')).toLowerCase() === 'true'; 
   
-    const statusToText = (status) => status ? "✅ 允许" : "❌ 屏蔽";
+    // 新增过滤器状态
+    const anyForwardStatus = (await getConfig('enable_forward_forwarding', env, 'true')).toLowerCase() === 'true'; 
+    const audioVoiceStatus = (await getConfig('enable_audio_forwarding', env, 'true')).toLowerCase() === 'true'; 
+    const stickerGifStatus = (await getConfig('enable_sticker_forwarding', env, 'true')).toLowerCase() === 'true'; 
     
-    // 构造回调数据：config:toggle:key:new_value (e.g., config:toggle:enable_image_forwarding:false)
-    const statusToCallback = (key, status) => `config:toggle:${key}:${status ? 'false' : 'true'}`;
-  
+    const statusToText = (status) => status ? "✅ 允许" : "❌ 屏蔽";
+    const statusToCallback = (key, currentStatus) => `config:toggle:${key}:${!currentStatus}`;
+    
     const menuText = `
   🔗 <b>按类型过滤管理</b>
-  点击按钮切换转发状态 (切换后立即生效)。
   
-  | 类型 | 状态 |
-  | :--- | :--- |
-  | <b>转发消息（用户/群组/频道）</b>| ${statusToText(anyForwardStatus)} |
-  | 频道转发消息 (细分) | ${statusToText(channelForwardStatus)} |
-  | <b>音频/语音消息</b> | ${statusToText(audioVoiceStatus)} |
-  | <b>贴纸/GIF (动画)</b> | ${statusToText(stickerGifStatus)} |
-  | 图片/视频/文件 | ${statusToText(mediaStatus)} |
-  | 链接消息 | ${statusToText(linkStatus)} |
-  | 纯文本消息 | ${statusToText(textStatus)} |
+  点击按钮切换开关状态（允许 / 屏蔽）：
+  
     `.trim();
   
     const menuKeyboard = {
         inline_keyboard: [
             // 新增的过滤类型
-            [{ text: `转发消息 (用户/群组/频道): ${statusToText(anyForwardStatus)}`, callback_data: statusToCallback('enable_forward_forwarding', anyForwardStatus) }],
+            [{ text: `任何转发消息 (Any Forward): ${statusToText(anyForwardStatus)}`, callback_data: statusToCallback('enable_forward_forwarding', anyForwardStatus) }],
             [{ text: `音频/语音消息 (Audio/Voice): ${statusToText(audioVoiceStatus)}`, callback_data: statusToCallback('enable_audio_forwarding', audioVoiceStatus) }],
             [{ text: `贴纸/GIF (Sticker/Animation): ${statusToText(stickerGifStatus)}`, callback_data: statusToCallback('enable_sticker_forwarding', stickerGifStatus) }],
             // 现有的过滤类型
@@ -1252,6 +1206,7 @@ async function dbConfigGet(key, env) {
             [{ text: `频道转发消息 (Channel Forward): ${statusToText(channelForwardStatus)}`, callback_data: statusToCallback('enable_channel_forwarding', channelForwardStatus) }],
             [{ text: `链接消息 (URL/TextLink): ${statusToText(linkStatus)}`, callback_data: statusToCallback('enable_link_forwarding', linkStatus) }],
             [{ text: `纯文本消息 (Pure Text): ${statusToText(textStatus)}`, callback_data: statusToCallback('enable_text_forwarding', textStatus) }],
+            
             [{ text: "⬅️ 返回主菜单", callback_data: "config:menu" }],
         ]
     };
@@ -1275,10 +1230,7 @@ async function dbConfigGet(key, env) {
     if (text.toLowerCase() === "/cancel") {
         // 删除状态
         await dbAdminStateDelete(userId, env);
-        await telegramApi(env.BOT_TOKEN, "sendMessage", {
-            chat_id: userId,
-            text: "✅ 编辑已取消。",
-        });
+        await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: "✅ 编辑已取消。", });
         await handleAdminConfigStart(userId, env);
         return;
     }
@@ -1286,70 +1238,86 @@ async function dbConfigGet(key, env) {
     if (adminState.action === 'awaiting_input' && adminState.key) {
         let successMsg = "";
         let finalValue = text;
-  
+        
+        // 验证答案和阈值特殊处理
         if (adminState.key === 'verif_a' || adminState.key === 'block_threshold') {
-            finalValue = text.trim(); 
-            successMsg = `✅ ${adminState.key} 已更新为 <code>${escapeHtml(finalValue)}</code>。`;
-        } else if (adminState.key === 'backup_group_id') {
-            finalValue = text.trim(); 
-            successMsg = `✅ 备份群组 ID 已更新为 <code>${escapeHtml(finalValue)}</code>。`;
-        } else if (adminState.key === 'authorized_admins') {
-            // 将输入字符串按逗号分隔，并清洗 ID/用户名列表
-            const rawAdmins = text.split(',').map(id => id.trim()).filter(id => id !== "");
-            // 移除潜在的 @ 前缀 (虽然 ID 也可以)
-            const cleanAdmins = rawAdmins.map(id => id.startsWith('@') ? id.substring(1) : id); 
-            finalValue = JSON.stringify(cleanAdmins);
-            successMsg = `✅ 授权协管员列表已更新。共 <b>${cleanAdmins.length}</b> 人。`;
-  
-        } else if (adminState.key === 'keyword_responses') {
-            // 新增自动回复规则：格式为 "关键词表达式 | 回复内容"
-            const parts = text.split('|');
+            finalValue = text.trim();
+            successMsg = `✅ ${adminState.key === 'verif_a' ? '验证答案' : '自动屏蔽阈值'} 已更新为: <code>${escapeHtml(finalValue)}</code>`;
+        } 
+        // 协管员列表特殊处理
+        else if (adminState.key === 'authorized_admins') {
+            // 清理并存储为 JSON 数组
+            const adminList = text.split(',').map(id => id.trim()).filter(id => id !== "");
+            finalValue = JSON.stringify(adminList);
+            successMsg = `✅ 协管员列表已更新。共授权 ${adminList.length} 人。`;
+        }
+        // 自动回复规则特殊处理
+        else if (adminState.key === 'keyword_responses') {
+            // 新增自动回复：格式为 关键词 | 回复内容
+            const parts = text.split('|').map(s => s.trim());
             if (parts.length < 2) {
-                await telegramApi(env.BOT_TOKEN, "sendMessage", {
-                    chat_id: userId,
-                    text: "❌ 格式错误！请使用： <code>关键词表达式 | 回复内容</code>",
-                    parse_mode: "HTML",
-                });
-                return;
+                 await telegramApi(env.BOT_TOKEN, "sendMessage", { 
+                    chat_id: userId, 
+                    text: "❌ 格式错误。请确保格式为：`关键词表达式 | 回复内容`", 
+                    parse_mode: "HTML"
+                 });
+                 return;
             }
-            const keywords = parts[0].trim();
-            const response = parts.slice(1).join('|').trim(); // 允许回复内容中包含 |
+            const [keywords, response] = parts;
             
-            if (!keywords || !response) {
-                 await telegramApi(env.BOT_TOKEN, "sendMessage", {
-                    chat_id: userId,
-                    text: "❌ 关键词或回复内容不能为空。",
-                    parse_mode: "HTML",
-                });
-                return;
+            // 尝试创建正则表达式以验证其有效性
+            try { new RegExp(keywords, 'gi'); } catch(e) {
+                 await telegramApi(env.BOT_TOKEN, "sendMessage", { 
+                    chat_id: userId, 
+                    text: `❌ 关键词表达式无效，请检查正则语法：\n${e.message}`,
+                    parse_mode: "HTML"
+                 });
+                 return;
             }
-  
+            
+            const newRule = { 
+                keywords: keywords, 
+                response: response, 
+                id: Date.now() // 使用时间戳作为唯一ID
+            };
+            
             const rules = await getAutoReplyRules(env);
-            rules.push({ keywords, response, id: Date.now() }); // 使用时间戳作为唯一ID
+            rules.push(newRule);
             finalValue = JSON.stringify(rules);
-            successMsg = `✅ 自动回复规则已新增： <code>${escapeHtml(keywords.substring(0, 15))}...</code>`;
+            successMsg = `✅ 自动回复规则已新增：\n关键词 <code>${escapeHtml(keywords)}</code>`;
             
             // 更新配置
             await dbConfigPut(adminState.key, finalValue, env);
             // 成功后清除状态
             await dbAdminStateDelete(userId, env);
             await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: successMsg, parse_mode: "HTML" });
-            await handleAdminAutoReplyMenu(userId, adminState.message_id, env); // 返回列表
+            await handleAdminRuleList(userId, adminState.message_id, env, 'keyword_responses'); // 返回列表
             return;
-  
-        } else if (adminState.key === 'block_keywords') {
+        }
+        // 屏蔽关键词特殊处理
+        else if (adminState.key === 'block_keywords') {
             // 新增屏蔽关键词：直接添加
             const newKeyword = text.trim();
             if (!newKeyword) {
-                 await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: "❌ 关键词不能为空。", });
+                await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: "❌ 关键词不能为空。", });
+                return;
+            }
+            // 尝试创建正则表达式以验证其有效性
+            try { new RegExp(newKeyword, 'gi'); } catch(e) {
+                 await telegramApi(env.BOT_TOKEN, "sendMessage", { 
+                    chat_id: userId, 
+                    text: `❌ 关键词表达式无效，请检查正则语法：\n${e.message}`,
+                    parse_mode: "HTML"
+                 });
                  return;
             }
+            
             const keywords = await getBlockKeywords(env);
             if (keywords.includes(newKeyword)) {
-                 await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: `⚠️ 关键词 <code>${escapeHtml(newKeyword)}</code> 已存在。`, parse_mode: "HTML" });
-                 return;
+                await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: `⚠️ 关键词 <code>${escapeHtml(newKeyword)}</code> 已存在。`, parse_mode: "HTML" });
+                return;
             }
-            keywords.push(newKeyword); 
+            keywords.push(newKeyword);
             finalValue = JSON.stringify(keywords);
             successMsg = `✅ 屏蔽关键词已新增： <code>${escapeHtml(newKeyword)}</code>`;
   
@@ -1358,17 +1326,31 @@ async function dbConfigGet(key, env) {
             // 成功后清除状态
             await dbAdminStateDelete(userId, env);
             await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: successMsg, parse_mode: "HTML" });
-            await handleAdminKeywordBlockMenu(userId, adminState.message_id, env); // 返回列表
+            await handleAdminRuleList(userId, adminState.message_id, env, 'block_keywords'); // 返回列表
             return;
-  
-        } else {
+        } 
+        // 备份群组ID特殊处理（如果输入是空的，则禁用）
+        else if (adminState.key === 'backup_group_id') {
+            finalValue = text.trim();
+             // 检查是否是合法的 group ID/username 格式（非空，且以 @, -100, 或纯数字开头）
+            if (finalValue !== "" && !finalValue.startsWith('@') && !finalValue.startsWith('-100') && isNaN(Number(finalValue))) {
+                 await telegramApi(env.BOT_TOKEN, "sendMessage", { 
+                    chat_id: userId, 
+                    text: "❌ 群组 ID 格式无效。请确保是数字 ID、`-100`开头的 ID 或 `@用户名`，或留空以禁用。", 
+                    parse_mode: "HTML"
+                 });
+                 return;
+            }
+            successMsg = finalValue ? `✅ 备份群组 ID 已更新为：<code>${escapeHtml(finalValue)}</code>` : "✅ 备份群组功能已禁用（ID已清除）。";
+        }
+        else {
             // 其他简单文本配置
             successMsg = `✅ ${adminState.key} 已更新。`;
         }
-        
+  
         // 更新配置
         await dbConfigPut(adminState.key, finalValue, env);
-  
+        
         // 成功后清除状态
         await dbAdminStateDelete(userId, env);
         await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: successMsg, parse_mode: "HTML" });
@@ -1378,53 +1360,55 @@ async function dbConfigGet(key, env) {
         await handleAdminConfigCallback(userId, adminState.message_id, parentMenu, env);
   
     } else {
-        await telegramApi(env.BOT_TOKEN, "sendMessage", {
-            chat_id: userId,
-            text: "⚠️ 机器人当前未处于配置输入状态。请使用 /start 重新进入主菜单。",
-        });
+        await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: "⚠️ 机器人当前未处于配置输入状态。请使用 /start 重新进入主菜单。", });
     }
   }
   
   async function handleAdminConfigCallback(chatId, messageId, callbackData, env) {
     const isPrimary = isPrimaryAdmin(chatId, env);
-    if (!isPrimary) return; 
+    if (!isPrimary) return;
   
     // 确保清除旧状态
     await dbAdminStateDelete(chatId, env);
   
     const parts = callbackData.split(':');
-    const actionType = parts[1]; // menu, edit, toggle, list, add, delete
+    const actionType = parts[1]; // menu, edit, toggle, rule
+    const targetKey = parts.length > 2 ? parts[2] : null;
   
     if (actionType === 'menu') {
-        const menu = parts[2] || 'main';
-        if (menu === 'main') {
-            await handleAdminConfigStart(chatId, env, messageId);
-        } else if (menu === 'base') {
+        const menuKey = targetKey;
+        if (menuKey === 'base') {
             await handleAdminBaseConfigMenu(chatId, messageId, env);
-        } else if (menu === 'autoreply') {
-            await handleAdminAutoReplyMenu(chatId, messageId, env);
-        } else if (menu === 'keyword') {
-            await handleAdminKeywordBlockMenu(chatId, messageId, env);
-        } else if (menu === 'filter') {
+        } else if (menuKey === 'autoreply') {
+            await handleAdminRuleList(chatId, messageId, env, 'keyword_responses');
+        } else if (menuKey === 'keyword') {
+            await handleAdminRuleList(chatId, messageId, env, 'block_keywords');
+        } else if (menuKey === 'filter') {
             await handleAdminTypeBlockMenu(chatId, messageId, env);
-        } else if (menu === 'authorized') {
+        } else if (menuKey === 'authorized') {
             await handleAdminAuthorizedConfigMenu(chatId, messageId, env);
-        } else if (menu === 'backup') {
+        } else if (menuKey === 'backup') {
             await handleAdminBackupConfigMenu(chatId, messageId, env);
+        } else {
+            // config:menu 或其他未知菜单，返回主菜单
+            await handleAdminConfigStart(chatId, env, messageId);
         }
-    } else if (actionType === 'edit' || actionType === 'add') {
-        const key = parts[2];
-        let prompt = "";
-        let parentMenu = `config:menu:${key.includes('keyword') || key.includes('responses') ? 'autoreply' : (key.includes('block') || key.includes('threshold') ? 'keyword' : (key.includes('authorized') ? 'authorized' : (key.includes('backup') ? 'backup' : 'base')))}`;
+        await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: parts[0], text: "菜单已刷新。", show_alert: false });
+        
+    } else if (actionType === 'edit') {
+        const key = targetKey;
+        let prompt = `请输入 ${key} 的新值：`;
+        let parentMenu = 'config:menu:base'; // 默认返回基础配置菜单
         
         if (key === 'welcome_msg') prompt = "请输入新的欢迎消息：";
         else if (key === 'verif_q') prompt = "请输入新的验证问题：";
-        else if (key === 'verif_a') prompt = "请输入新的验证答案（支持多个验证答案，多个答案中请用|分隔。）：";
-        else if (key === 'block_threshold') prompt = "请输入新的屏蔽次数阈值（纯数字）：";
-        else if (key === 'backup_group_id') prompt = "请输入备份群组的 ID 或 @用户名：";
-        else if (key === 'authorized_admins') prompt = "请输入新的协管员 ID 或 @用户名（多个用逗号分隔）：";
-        else if (key === 'keyword_responses') prompt = "请输入新的自动回复规则，格式为：\n`关键词表达式 | 回复内容`\n（关键词支持正则表达式，但请谨慎使用）";
-        else if (key === 'block_keywords') prompt = "请输入新的屏蔽关键词（支持正则表达式，但请谨慎使用）：";
+        else if (key === 'verif_a') { prompt = "请输入新的验证答案（如果设置了多个答案，请使用 `|` 符号分隔）："; }
+        else if (key === 'block_threshold') { prompt = "请输入新的自动屏蔽触发次数（数字）："; parentMenu = 'config:menu:keyword'; }
+        else if (key === 'authorized_admins') { prompt = "请输入新的协管员 ID 或 @用户名（多个用逗号分隔）："; parentMenu = 'config:menu:authorized'; }
+        else if (key === 'backup_group_id') { prompt = "请输入备份群组的 ID 或 @用户名（留空以禁用）："; parentMenu = 'config:menu:backup'; }
+        else if (key === 'keyword_responses') { prompt = "请输入新的自动回复规则，格式为：\n`关键词表达式 | 回复内容`\n（关键词支持正则表达式，但请谨慎使用）"; parentMenu = 'config:menu:autoreply'; }
+        else if (key === 'block_keywords') { prompt = "请输入新的屏蔽关键词（支持正则表达式，但请谨慎使用）："; parentMenu = 'config:menu:keyword'; }
+        
         else if (key.endsWith('_clear')) { // 清除操作
             if (key === 'authorized_admins_clear') {
                 await dbConfigPut('authorized_admins', '[]', env);
@@ -1439,7 +1423,12 @@ async function dbConfigGet(key, env) {
             return;
         }
   
-        const state = { action: 'awaiting_input', key: key, message_id: messageId, parent_menu: parentMenu };
+        const state = {
+            action: 'awaiting_input',
+            key: key,
+            message_id: messageId,
+            parent_menu: parentMenu
+        };
         await dbAdminStatePut(chatId, JSON.stringify(state), env);
         
         await telegramApi(env.BOT_TOKEN, "editMessageText", {
@@ -1447,56 +1436,62 @@ async function dbConfigGet(key, env) {
             message_id: messageId,
             text: `${prompt}\n\n请直接回复本消息。\n输入 /cancel 取消。`,
             parse_mode: "HTML",
-            reply_markup: { inline_keyboard: [[{ text: "⬅️ 取消编辑并返回", callback_data: parentMenu }]] }
+            reply_markup: {
+                inline_keyboard: [[{ text: "⬅️ 取消编辑并返回", callback_data: parentMenu }]]
+            }
         });
+        
         await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: parts[0], text: "请回复新的内容。", show_alert: false });
+  
     } else if (actionType === 'toggle') {
         const key = parts[2];
         const newValue = parts[3]; // 'true' or 'false'
+        
         await dbConfigPut(key, newValue, env);
         
         const statusText = newValue === 'true' ? '已允许' : '已屏蔽';
-        await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: parts[0], text: `✅ ${key} 状态已切换为 ${statusText}`, show_alert: false });
+        await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: parts[0], text: `✅ ${key} 已切换为：${statusText}`, show_alert: false });
         
-        // 刷新列表
+        // 刷新过滤菜单
         await handleAdminTypeBlockMenu(chatId, messageId, env);
   
-    } else if (actionType === 'list') {
-        const key = parts[2];
-        await handleAdminRuleList(chatId, messageId, env, key);
-        await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: parts[0], text: "规则列表已刷新。", show_alert: false });
-  
-    } else if (actionType === 'delete') {
-        const key = parts[2];
-        const id = parts[3];
-        // BUG FIX: 传递正确的 callbackQueryId
-        await handleAdminRuleDelete(chatId, messageId, parts[0], env, key, id);
-        // handleAdminRuleDelete 内部已经处理了 answerCallbackQuery 和刷新列表
+    } else if (actionType === 'rule') {
+        const ruleAction = parts[2];
+        const key = parts[3];
+        const id = parts[4]; // keyword_responses 的 ID 或 block_keywords 的关键词
+        
+        if (ruleAction === 'delete') {
+            // parts[0] 是 callback_query_id
+            await handleAdminRuleDelete(chatId, messageId, parts[0], env, key, id);
+        } else {
+            await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: parts[0], text: "未知规则操作。", show_alert: false });
+        }
     }
+    
   }
   
   async function handleCallbackQuery(callbackQuery, env) {
     const callbackData = callbackQuery.data;
-    const chatId = callbackQuery.from.id.toString();
-    const messageId = callbackQuery.message?.message_id;
-    const isPrimary = isPrimaryAdmin(chatId, env);
+    const messageId = callbackQuery.message.message_id;
+    const adminGroupIdStr = env.ADMIN_GROUP_ID.toString();
+    
+    // 主菜单和配置处理
+    if (callbackData.startsWith('config:')) {
+        await handleAdminConfigCallback(callbackQuery.from.id.toString(), messageId, callbackData, env);
+        return;
+    }
   
-    if (callbackData.startsWith('config:') && isPrimary) {
-        // 管理员配置逻辑
-        await handleAdminConfigCallback(chatId, messageId, callbackData, env);
-    } else if (callbackData.startsWith('block:') || callbackData.startsWith('unblock:')) {
-        // 屏蔽/解禁用户
-        const parts = callbackData.split(':');
-        const action = parts[0];
-        const userIdToModify = parts[1];
+    // 屏蔽/解禁操作
+    if (callbackData.startsWith('block:') || callbackData.startsWith('unblock:')) {
+        const action = callbackData.split(':')[0]; // 'block' or 'unblock'
+        const userIdToModify = callbackData.split(':')[1];
         const isBlocked = action === 'block';
-  
+        
         await dbUserUpdate(userIdToModify, { is_blocked: isBlocked, block_count: 0 }, env); // 屏蔽时重置计数
   
         const resultText = isBlocked ? "🚫 用户已被屏蔽。机器人将不再转发此人的消息。" : "✅ 用户已解除屏蔽。";
-        
+  
         // 更新按钮
-        const user = await dbUserGetOrCreate(userIdToModify, env);
         const newButtons = getInfoCardButtons(userIdToModify, isBlocked);
   
         await telegramApi(env.BOT_TOKEN, "editMessageReplyMarkup", {
@@ -1510,7 +1505,6 @@ async function dbConfigGet(key, env) {
             text: resultText,
             show_alert: true,
         });
-  
     } else if (callbackData.startsWith('pin_card:')) {
         // 置顶消息
         try {
@@ -1532,6 +1526,61 @@ async function dbConfigGet(key, env) {
                 show_alert: true,
             });
         }
+    } else if (callbackData.startsWith('reset_session:')) { // [NEW] Reset Session Logic
+        // 1. 权限检查
+        const senderId = callbackQuery.from.id.toString();
+        const isAuthorizedAdmin = await isAdminUser(senderId, env);
+
+        if (!isAuthorizedAdmin) {
+             await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", {
+                callback_query_id: callbackQuery.id,
+                text: "❌ 权限不足，只有管理员才能重置用户会话。",
+                show_alert: true,
+            });
+            return;
+        }
+
+        // 2. 获取话题ID和用户ID
+        const topicId = callbackQuery.message.message_thread_id.toString();
+        const userIdToReset = callbackData.split(':')[1];
+        
+        // 3. 执行重置逻辑 (使用现有的 dbUserResetStateByTopicId)
+        const resetUserId = await dbUserResetStateByTopicId(topicId, env);
+        
+        let responseTextForAdmin = "";
+        
+        if (resetUserId) {
+            responseTextForAdmin = `✅ 当前会话已结束。用户 ${userIdToReset} 下次私聊时将需要重新验证。`;
+            
+            // (Optional) Notify user (Similar logic to /reset command)
+            try {
+                await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                    chat_id: resetUserId,
+                    text: "⚠️ 管理员已结束您的当前会话。如果您再次私聊机器人，将需要重新开始验证。/start 重新发起会话",
+                    parse_mode: 'Markdown'
+                });
+            } catch (e) {
+                responseTextForAdmin += " (但无法向用户发送通知)";
+            }
+        } else {
+            responseTextForAdmin = "❌ 错误：无法找到此话题对应的用户记录。";
+        }
+
+        // 4. 回复管理员确认 (使用 alert)
+        await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", {
+            callback_query_id: callbackQuery.id,
+            text: responseTextForAdmin,
+            show_alert: true,
+        });
+
+        // 5. 在话题内发送一条确认消息 (以确保管理员能看到，即使资料卡不在视野中)
+        await telegramApi(env.BOT_TOKEN, "sendMessage", {
+            chat_id: adminGroupIdStr,
+            message_thread_id: topicId,
+            text: responseTextForAdmin,
+            parse_mode: 'HTML',
+        });
+        
     } else {
         await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", {
             callback_query_id: callbackQuery.id,
@@ -1541,108 +1590,89 @@ async function dbConfigGet(key, env) {
     }
   }
   
-  
   // --- 消息中继和话题管理 ---
-  
   /**
    * 核心功能：用户私聊 -> 管理员群组话题
    */
   async function handleRelayToTopic(message, user, env) {
     const chatId = message.chat.id.toString();
     const fromUser = message.from;
-  
-    let topicId = user.topic_id; 
+    let topicId = user.topic_id;
     let userInfoCard = user.user_info; // 从 D1 获取存储的资料卡
   
     // 1. 如果没有 topic_id，创建新话题
     if (!topicId) {
         const { topicName, infoCard } = getUserInfo(fromUser, message.date);
-        
         try {
             // 1.1. 创建话题
-            const topicResult = await telegramApi(env.BOT_TOKEN, "createForumTopic", {
+            const topic = await telegramApi(env.BOT_TOKEN, "createForumTopic", {
                 chat_id: env.ADMIN_GROUP_ID,
                 name: topicName,
             });
-            topicId = topicResult.message_thread_id.toString();
-            
-            // 1.2. 更新 D1 记录
-            await dbUserUpdate(chatId, { topic_id: topicId, user_info: { infoCard, messageId: null, timestamp: message.date } }, env);
-            
-            // 1.3. 发送资料卡到话题，并置顶
+            topicId = topic.message_thread_id.toString();
+  
+            // 1.2. 发送资料卡到新话题
             const cardMessage = await telegramApi(env.BOT_TOKEN, "sendMessage", {
                 chat_id: env.ADMIN_GROUP_ID,
+                message_thread_id: topicId,
                 text: infoCard,
                 parse_mode: "HTML",
-                message_thread_id: topicId,
-                reply_markup: getInfoCardButtons(chatId, false) // 初始非屏蔽状态
+                reply_markup: getInfoCardButtons(chatId, user.is_blocked)
             });
-            
-            // 1.4. 更新 D1 存储资料卡消息ID
-            await dbUserUpdate(chatId, { user_info: { infoCard, messageId: cardMessage.message_id, timestamp: message.date } }, env);
   
-            // 1.5. 置顶资料卡
-            await telegramApi(env.BOT_TOKEN, "pinChatMessage", {
-                chat_id: env.ADMIN_GROUP_ID,
-                message_id: cardMessage.message_id,
-                disable_notification: true
-            });
+            // 1.3. 更新 D1 记录
+            userInfoCard = { messageId: cardMessage.message_id.toString(), timestamp: message.date };
+            await dbUserUpdate(chatId, { topic_id: topicId, user_info: userInfoCard }, env);
+  
+            // 1.4. 首次转发后，尝试将资料卡置顶（如果群组允许）
+            try {
+                 await telegramApi(env.BOT_TOKEN, "pinChatMessage", { 
+                    chat_id: env.ADMIN_GROUP_ID, 
+                    message_id: cardMessage.message_id, 
+                    disable_notification: true 
+                 });
+            } catch (e) {
+                 // 忽略置顶失败，可能是权限问题
+            }
   
         } catch (e) {
-            const errorMessage = `❌ 转发失败！创建话题或发送资料卡出错：${e.message}`;
-            console.error(errorMessage);
-            await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: errorMessage });
+            const errorText = `❌ 创建话题失败，无法转发消息。错误详情：${e.message}`;
+            console.error(errorText);
+            await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: errorText });
             return;
         }
     } else {
-        // 2. 如果话题已存在，检查话题名称是否需要更新（例如，用户名/昵称变更）
-        if (userInfoCard && message.date > userInfoCard.timestamp) {
-            const { topicName, infoCard, userId } = getUserInfo(fromUser, userInfoCard.timestamp);
-            
-            // 只有名称不同才更新
-            if (topicName !== user.topic_id_name) {
-                try {
-                    await telegramApi(env.BOT_TOKEN, "setForumTopicTitle", {
-                        chat_id: env.ADMIN_GROUP_ID,
-                        message_thread_id: topicId,
-                        title: topicName
-                    });
-                } catch (e) {
-                    // 忽略 setForumTopicTitle 失败 (可能是权限不足)
-                    // console.log("Failed to update topic title:", e.message);
-                }
+        // 2. 如果有 topic_id，更新话题资料卡中的时间戳 (如果话题存在)
+        // 使用存储的 messageId 再次发送资料卡，以更新时间戳
+        if (userInfoCard && userInfoCard.messageId) {
+            const { infoCard } = getUserInfo(fromUser, message.date);
+            try {
+                // 重新发送资料卡，并更新 D1 存储
+                await telegramApi(env.BOT_TOKEN, "editMessageText", {
+                    chat_id: env.ADMIN_GROUP_ID,
+                    message_id: userInfoCard.messageId,
+                    text: infoCard,
+                    parse_mode: "HTML",
+                    reply_markup: getInfoCardButtons(chatId, user.is_blocked)
+                });
+            } catch (e) {
+                // 忽略编辑失败
             }
-            
-            // 检查是否需要更新资料卡消息
-            if (userInfoCard.messageId) {
-                try {
-                    // 重新发送资料卡，并更新 D1 存储
-                    await telegramApi(env.BOT_TOKEN, "editMessageText", {
-                        chat_id: env.ADMIN_GROUP_ID,
-                        message_id: userInfoCard.messageId,
-                        text: infoCard,
-                        parse_mode: "HTML",
-                        reply_markup: getInfoCardButtons(userId, user.is_blocked) 
-                    });
-                } catch (e) {
-                    // 忽略编辑失败
-                }
-            }
-            
-            // 更新 user_info_json 中的时间戳
-            await dbUserUpdate(chatId, { user_info: { ...userInfoCard, timestamp: message.date } }, env);
         }
+        // 更新 user_info_json 中的时间戳
+        await dbUserUpdate(chatId, { user_info: { ...userInfoCard, timestamp: message.date } }, env);
     }
   
     // 3. 转发用户消息到话题
+    // [修复 Bug 2]：将 copyParams 移到 try/catch 块外部，确保其在 catch 块中可访问
+    const copyParams = {
+        chat_id: env.ADMIN_GROUP_ID,
+        from_chat_id: chatId,
+        message_id: message.message_id,
+        message_thread_id: topicId,
+    };
+
     try {
-        const copyParams = {
-            chat_id: env.ADMIN_GROUP_ID,
-            from_chat_id: chatId,
-            message_id: message.message_id,
-            message_thread_id: topicId,
-        };
-  
         // 备份群组（可选）
         const backupGroupId = await getConfig('backup_group_id', env, "");
         if (backupGroupId) {
@@ -1657,7 +1687,7 @@ async function dbConfigGet(key, env) {
         }
         
         const topicMessage = await telegramApi(env.BOT_TOKEN, "copyMessage", copyParams);
-        
+  
         // 存储消息映射关系 (用于处理已编辑消息 - User -> Admin)
         await dbMessageDataPut(chatId, message.message_id.toString(), { 
             text: message.text || message.caption || "[媒体内容]", 
@@ -1665,73 +1695,38 @@ async function dbConfigGet(key, env) {
         }, env);
   
     } catch (e) {
-        // **【核心 BUG 修复区域】**
+        // **【核心 BUG 修复区域：话题不存在的自愈逻辑】**
         const errorMessage = e.message || e.description || JSON.stringify(e);
-  
         // 检查是否是“话题不存在”的错误
         if (errorMessage.includes("message thread not found")) {
             console.warn(`[Auto-Fix] 话题 ID ${topicId} 已失效。为用户 ${chatId} 尝试重建话题。`);
-            
             try {
                 // 1. 清除数据库中错误的 topic_id 和 user_info_json，强制下次重新创建
-                // **【关键修复点】**
-                await dbUserUpdate(chatId, { topic_id: null, user_info_json: null }, env); 
+                await dbUserUpdate(chatId, { topic_id: null, user_info_json: null }, env);
   
-                // 2. 重新执行创建话题的逻辑 (从 if (!topicId) 块复制)
+                // 2. 重新执行创建话题的逻辑 (从 if (!topicId... 开始)
                 const { topicName, infoCard } = getUserInfo(fromUser, message.date);
+                const topic = await telegramApi(env.BOT_TOKEN, "createForumTopic", { chat_id: env.ADMIN_GROUP_ID, name: topicName });
+                const newTopicId = topic.message_thread_id.toString();
                 
-                // 2.1. 创建话题
-                const topicResult = await telegramApi(env.BOT_TOKEN, "createForumTopic", {
-                    chat_id: env.ADMIN_GROUP_ID,
-                    name: topicName,
-                });
-                const newTopicId = topicResult.message_thread_id.toString();
-                
-                // 2.2. 更新 D1 记录
-                await dbUserUpdate(chatId, { topic_id: newTopicId, user_info: { infoCard, messageId: null, timestamp: message.date } }, env);
-                
-                // 2.3. 发送资料卡到话题，并置顶
                 const cardMessage = await telegramApi(env.BOT_TOKEN, "sendMessage", {
                     chat_id: env.ADMIN_GROUP_ID,
+                    message_thread_id: newTopicId,
                     text: infoCard,
                     parse_mode: "HTML",
-                    message_thread_id: newTopicId,
-                    reply_markup: getInfoCardButtons(chatId, false)
+                    reply_markup: getInfoCardButtons(chatId, user.is_blocked)
                 });
                 
-                // 2.4. 更新 D1 存储资料卡消息ID
-                await dbUserUpdate(chatId, { user_info: { infoCard, messageId: cardMessage.message_id, timestamp: message.date } }, env);
-    
-                // 2.5. 置顶资料卡
-                await telegramApi(env.BOT_TOKEN, "pinChatMessage", {
-                    chat_id: env.ADMIN_GROUP_ID,
-                    message_id: cardMessage.message_id,
-                    disable_notification: true
-                });
+                // 3. 更新 D1 记录
+                const newCardInfo = { messageId: cardMessage.message_id.toString(), timestamp: message.date };
+                await dbUserUpdate(chatId, { topic_id: newTopicId, user_info: newCardInfo }, env);
                 
-                // 3. 再次尝试转发用户消息到新的话题
-                const copyParamsRetry = {
-                    chat_id: env.ADMIN_GROUP_ID,
-                    from_chat_id: chatId,
-                    message_id: message.message_id,
-                    message_thread_id: newTopicId,
-                };
-  
-                // 备份群组（可选）- 重新执行备份逻辑
-                const backupGroupId = await getConfig('backup_group_id', env, "");
-                if (backupGroupId) {
-                    try {
-                        const backupParams = { ...copyParamsRetry, chat_id: backupGroupId };
-                        delete backupParams.message_thread_id; 
-                        await telegramApi(env.BOT_TOKEN, "copyMessage", backupParams);
-                    } catch(e) {
-                        console.error("Failed to copy message to backup group on retry:", e.message);
-                    }
-                }
-  
-                await telegramApi(env.BOT_TOKEN, "copyMessage", copyParamsRetry);
+                // 4. 再次转发消息到新话题
+                // [修复 Bug 2]: copyParams 现在是可访问的
+                const newCopyParams = { ...copyParams, message_thread_id: newTopicId };
+                await telegramApi(env.BOT_TOKEN, "copyMessage", newCopyParams);
                 
-                // 4. 存储消息映射关系
+                // 5. 存储消息映射关系
                 await dbMessageDataPut(chatId, message.message_id.toString(), { 
                     text: message.text || message.caption || "[媒体内容]", 
                     date: message.date 
@@ -1739,7 +1734,6 @@ async function dbConfigGet(key, env) {
   
                 // 修复成功，退出函数
                 return;
-  
             } catch (retryError) {
                 // 如果二次尝试仍然失败
                 const retryErrorMessage = `❌ 转发失败！自动重建话题失败，请联系管理员。错误详情：${retryError.message}`;
@@ -1759,16 +1753,14 @@ async function dbConfigGet(key, env) {
   
   /**
    * 核心功能：管理员回复话题 -> 用户私聊
-   * [修改]：新增逻辑，存储管理员的回复消息内容和时间，用于后续编辑跟踪。
+   * [新增]：处理 /reset 和 /unverify 命令
    */
   async function handleAdminReply(message, env) {
     // 1. 确保是话题内的消息
     if (!message.is_topic_message || !message.message_thread_id) return;
-  
     // 2. 检查是否来自管理员群组
     const adminGroupIdStr = env.ADMIN_GROUP_ID.toString();
     if (message.chat.id.toString() !== adminGroupIdStr) return;
-  
     // 3. 忽略机器人自己的消息
     if (message.from && message.from.is_bot) return;
   
@@ -1776,135 +1768,193 @@ async function dbConfigGet(key, env) {
     const senderId = message.from.id.toString();
     const isAuthorizedAdmin = await isAdminUser(senderId, env);
     
-    if (!isAuthorizedAdmin) {
-        // 只有管理员的回复才转发
-        return; 
-    }
-  
-    // 5. 根据话题ID查找用户ID
+    // --- [新增功能] 重置用户状态命令处理 (当话题被删除前使用) ---
     const topicId = message.message_thread_id.toString();
-    const userId = await dbTopicUserGet(topicId, env);
+    const isCommand = message.text && message.text.startsWith('/');
   
-    if (!userId) {
-        // 如果找不到用户ID，说明此话题不是由机器人创建或已被清除
-        try {
+    if (topicId && isCommand) {
+        const command = message.text.split(/\s+/)[0].substring(1); 
+        
+        if (command === 'unverify' || command === 'reset') {
+            // 1. 权限检查
+            if (!isAuthorizedAdmin) { 
+                await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                    chat_id: adminGroupIdStr,
+                    message_thread_id: topicId,
+                    text: "权限不足，只有管理员才能重置用户会话。",
+                    reply_to_message_id: message.message_id
+                });
+                return;
+            }
+  
+            // 2. 执行重置操作
+            const resetUserId = await dbUserResetStateByTopicId(topicId, env);
+            
+            let responseText;
+            if (resetUserId) {
+                responseText = `✅ **会话已重置**\n用户 ID: <code>${resetUserId}</code>\n下次私聊时将需要重新验证。`;
+                
+                // 3. (可选) 通知被重置的用户
+                try {
+                    await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                        chat_id: resetUserId,
+                        text: "⚠️ 管理员已结束您的当前会话。如果您再次私聊机器人，将需要重新开始验证。",
+                        parse_mode: 'Markdown'
+                    });
+                } catch (e) {
+                    console.error(`无法通知用户 ${resetUserId} 会话已重置:`, e.message);
+                    responseText += "\n\n(❗️ 无法向用户发送通知消息，可能已被屏蔽)";
+                }
+  
+            } else {
+                responseText = "❌ 错误：无法找到此话题对应的用户记录（话题可能已被关闭或用户未通过验证）。";
+            }
+  
+            // 4. 回复管理员确认
             await telegramApi(env.BOT_TOKEN, "sendMessage", {
-                chat_id: message.chat.id,
-                text: "⚠️ 警告：无法找到此话题对应的用户ID，回复未转发。",
+                chat_id: adminGroupIdStr,
                 message_thread_id: topicId,
+                text: responseText,
+                parse_mode: 'HTML',
+                reply_to_message_id: message.message_id
             });
-        } catch (e) { /* ignore */ }
+            
+            return; // 命令处理完毕，退出
+        }
+    }
+    // --- [新增功能] 结束 ---
+  
+    // 5. 如果不是命令，继续处理回复中继
+    if (!isAuthorizedAdmin) { // 只有管理员的回复才转发
         return;
     }
   
-    // 6. 转发消息给用户
-    try {
-        // 尝试使用 copyMessage 转发，保留格式和媒体
-        await telegramApi(env.BOT_TOKEN, "copyMessage", {
-            chat_id: userId,
-            from_chat_id: message.chat.id,
-            message_id: message.message_id,
+    // 6. 根据话题ID查找用户ID
+    // const topicId = message.message_thread_id.toString(); // 变量已在上面定义
+    const userId = await dbTopicUserGet(topicId, env);
+    if (!userId) {
+        await telegramApi(env.BOT_TOKEN, "sendMessage", {
+            chat_id: adminGroupIdStr,
+            message_thread_id: topicId,
+            text: "❌ 无法找到此话题对应的用户记录，请检查话题是否为用户私聊转发话题。",
+            reply_to_message_id: message.message_id
         });
+        return;
+    }
   
-        // 7. [新增] 存储消息映射关系 (用于处理已编辑消息 - Admin -> User)
-        // 使用 user_id (私聊ID) + message.message_id (管理员群组消息ID) 作为键
-        await dbMessageDataPut(userId, message.message_id.toString(), { 
-            text: message.text || message.caption || "[媒体内容]", 
-            date: message.date 
-        }, env);
+    let success = false;
+    
+    // 7. 转发/发送消息
+    try {
+        // 如果是回复消息，转发回复的目标消息
+        if (message.reply_to_message) {
+            // 检查回复的是否是机器人转发的用户消息
+            const replyMsgId = message.reply_to_message.message_id.toString();
+            // 从 D1 查找 User -> Admin 消息映射，但此处不需要，直接转发回复消息即可。
+        }
+  
+        // 根据消息类型转发 (支持文本/媒体/贴纸等)
+        if (message.text) {
+            // 纯文本回复
+            await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                chat_id: userId,
+                text: message.text,
+                parse_mode: message.parse_mode, // 保留管理员消息的格式
+            });
+            success = true;
+        } else if (message.photo) {
+            await telegramApi(env.BOT_TOKEN, "sendPhoto", {
+                chat_id: userId,
+                photo: message.photo[message.photo.length - 1].file_id,
+                caption: message.caption || "",
+                parse_mode: message.caption_parse_mode,
+            });
+            success = true;
+        } else if (message.video) {
+            await telegramApi(env.BOT_TOKEN, "sendVideo", {
+                chat_id: userId,
+                video: message.video.file_id,
+                caption: message.caption || "",
+                parse_mode: message.caption_parse_mode,
+            });
+            success = true;
+        } else if (message.document) {
+            await telegramApi(env.BOT_TOKEN, "sendDocument", {
+                chat_id: userId,
+                document: message.document.file_id,
+                caption: message.caption || "",
+                parse_mode: message.caption_parse_mode,
+            });
+            success = true;
+        } else if (message.audio) {
+            await telegramApi(env.BOT_TOKEN, "sendAudio", {
+                chat_id: userId,
+                audio: message.audio.file_id,
+                caption: message.caption || "",
+                parse_mode: message.caption_parse_mode,
+            });
+            success = true;
+        } else if (message.voice) {
+            await telegramApi(env.BOT_TOKEN, "sendVoice", {
+                chat_id: userId,
+                voice: message.voice.file_id,
+                caption: message.caption || "",
+            });
+            success = true;
+        } else if (message.sticker) {
+            await telegramApi(env.BOT_TOKEN, "sendSticker", {
+                chat_id: userId,
+                sticker: message.sticker.file_id,
+            });
+            success = true;
+        } else if (message.animation) {
+            await telegramApi(env.BOT_TOKEN, "sendAnimation", {
+                chat_id: userId,
+                animation: message.animation.file_id,
+                caption: message.caption || "",
+            });
+            success = true;
+        } else {
+            await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                chat_id: userId,
+                text: "管理员发送了机器人无法直接转发的内容（例如投票或某些特殊媒体）。",
+            });
+            success = true; // 即使是警告消息，也视为成功发送
+        }
+  
+        if (success) {
+            // 存储消息映射关系 (用于处理已编辑消息 - Admin -> User)
+            // 存储时使用 userId (私聊目标) + messageId (管理员群组消息ID)
+            await dbMessageDataPut(userId, message.message_id.toString(), { 
+                text: message.text || message.caption || "[媒体内容]", 
+                date: message.date 
+            }, env);
+        }
   
     } catch (e) {
-        // 7. 如果 copyMessage 失败 (通常是因为回复了机器人无法直接转发的内容，如服务消息或某些特殊媒体)
-        // 尝试降级处理，只发送文本/媒体文件（复制）
-        console.error("handleAdminReply copyMessage failed, attempting fallback:", e?.message || e);
-  
-        try {
-            // 在降级成功的情况下，也需要存储消息内容
-            const textContent = message.text || message.caption || "[媒体内容]";
-            let success = false;
-            
-            if (message.text) {
-                await telegramApi(env.BOT_TOKEN, "sendMessage", {
-                    chat_id: userId,
-                    text: message.text,
-                    parse_mode: "HTML", // 保持解析模式
-                });
-                success = true;
-            } else if (message.photo) {
-                // 发送最高分辨率的图片
-                const largestPhoto = message.photo.pop();
-                await telegramApi(env.BOT_TOKEN, "sendPhoto", {
-                    chat_id: userId,
-                    photo: largestPhoto.file_id,
-                    caption: message.caption || "",
-                });
-                success = true;
-            } else if (message.video) {
-                await telegramApi(env.BOT_TOKEN, "sendVideo", {
-                    chat_id: userId,
-                    video: message.video.file_id,
-                    caption: message.caption || "",
-                });
-                success = true;
-            } else if (message.audio) {
-                await telegramApi(env.BOT_TOKEN, "sendAudio", {
-                    chat_id: userId,
-                    audio: message.audio.file_id,
-                    caption: message.caption || "",
-                });
-                success = true;
-            } else if (message.voice) {
-                await telegramApi(env.BOT_TOKEN, "sendVoice", {
-                    chat_id: userId,
-                    voice: message.voice.file_id,
-                    caption: message.caption || "",
-                });
-                success = true;
-            } else if (message.sticker) {
-                await telegramApi(env.BOT_TOKEN, "sendSticker", {
-                    chat_id: userId,
-                    sticker: message.sticker.file_id,
-                });
-                success = true;
-            } else if (message.animation) {
-                await telegramApi(env.BOT_TOKEN, "sendAnimation", {
-                    chat_id: userId,
-                    animation: message.animation.file_id,
-                    caption: message.caption || "",
-                });
-                success = true;
-            } else {
-                await telegramApi(env.BOT_TOKEN, "sendMessage", {
-                    chat_id: userId,
-                    text: "管理员发送了机器人无法直接转发的内容（例如投票或某些特殊媒体）。",
-                });
-                success = true; // 即使是警告消息，也视为成功发送
-            }
-  
-            if (success) {
-                 // 存储消息映射关系 (用于处理已编辑消息 - Admin -> User)
-                await dbMessageDataPut(userId, message.message_id.toString(), { 
-                    text: textContent, 
-                    date: message.date 
-                }, env);
-            }
-  
-        } catch (e2) {
-            console.error("handleAdminReply fallback also failed:", e2?.message || e2);
-        }
+        const errorText = `❌ 转发管理员回复失败。错误详情：${e.message}`;
+        console.error(errorText);
+        await telegramApi(env.BOT_TOKEN, "sendMessage", {
+            chat_id: adminGroupIdStr,
+            message_thread_id: topicId,
+            text: `❌ 转发给用户失败，可能用户已屏蔽机器人。错误详情：${e.message}`,
+            reply_to_message_id: message.message_id
+        });
     }
   }
   
   /**
-   * 用户编辑消息 -> 管理员话题编辑
+   * 核心功能：用户编辑私聊消息 -> 管理员群组话题
+   * [修改]：新增逻辑，存储用户编辑后的消息内容和时间，用于后续编辑跟踪。
    */
   async function handleRelayEditedMessage(editedMessage, env) {
-    const userId = editedMessage.chat.id.toString();
+    const chatId = editedMessage.chat.id.toString();
+    const userId = chatId;
     const messageId = editedMessage.message_id.toString();
     
-    // 1. 确保用户是已验证状态（已在 handlePrivateMessage 中处理，此处只进行二次确认）
+    // 1. 检查用户状态（已在 handlePrivateMessage 中处理，此处只进行二次确认）
     const user = await dbUserGetOrCreate(userId, env);
-    if (user.user_state !== "verified" || !user.topic_id) return;
+    if (user.user_state !== "verified" || user.is_blocked || !user.topic_id) return;
     
     // 2. 从消息表中查找原始消息的文本和发送日期（已在 handleRelayToTopic 中存储）
     const storedMessage = await dbMessageDataGet(userId, messageId, env);
@@ -1935,15 +1985,15 @@ async function dbConfigGet(key, env) {
     try {
         await telegramApi(env.BOT_TOKEN, "sendMessage", {
             chat_id: env.ADMIN_GROUP_ID,
+            message_thread_id: user.topic_id,
             text: notificationText,
             parse_mode: "HTML",
-            message_thread_id: user.topic_id,
         });
-        
+  
         // 5. 更新消息表中的存储内容 (用于下次编辑时作为"原消息")
         await dbMessageDataPut(userId, messageId, { text: newText, date: editedMessage.edit_date || editedMessage.date }, env);
   
     } catch (e) {
-        console.error("Failed to notify admin about edited message:", e.message);
+        console.error("handleRelayEditedMessage: Failed to relay edited message to admin:", e?.message || e);
     }
   }
