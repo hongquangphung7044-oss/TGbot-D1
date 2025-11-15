@@ -2,6 +2,8 @@
 
 ### 功能简介
 
+### 因重大版本BUG，导致了管理员面板失效无法验证等问题 所以版本回滚到2.3，经测试小BUG不影响使用
+
 这是一个基于 Cloudflare Worker 和 D1 数据库的 Telegram 双向机器人代码。它将用户私聊消息转发到管理员群组的话题（Topic）中，并将管理员在话题中的回复中继回用户私聊。
 
 [不会使用直接看教程](https://github.com/moistrr/TGbot-D1/blob/main/%E5%9F%BA%E4%BA%8ED1%E7%9A%84cloudflare%E5%88%9B%E5%BB%BA%E7%9A%84%E5%8F%8C%E5%90%91%E6%9C%BA%E5%99%A8%E4%BA%BA%E4%BF%9D%E5%A7%86%E7%BA%A7%E6%95%99%E7%A8%8B.pdf)
