@@ -24,17 +24,18 @@ async function dbConfigGet(key, env) {
     let user = await env.TG_BOT_DB.prepare("SELECT * FROM users WHERE user_id = ?").bind(userId).first();
   
     if (!user) {
-        // 插入默认记录
+        // [⭐️ 修改] 插入默认记录 (包含 is_muted)
         await env.TG_BOT_DB.prepare(
-            "INSERT INTO users (user_id, user_state, is_blocked, block_count) VALUES (?, 'new', 0, 0)"
+            "INSERT INTO users (user_id, user_state, is_blocked, is_muted, block_count) VALUES (?, 'new', 0, 0, 0)"
         ).bind(userId).run();
         // 重新查询以获取完整的默认记录
         user = await env.TG_BOT_DB.prepare("SELECT * FROM users WHERE user_id = ?").bind(userId).first();
     }
     
-    // 将 is_blocked 转换为布尔值，并解析 JSON 字段
+    // 将 is_blocked 和 is_muted 转换为布尔值，并解析 JSON 字段
     if (user) {
         user.is_blocked = user.is_blocked === 1;
+        user.is_muted = user.is_muted === 1; // [⭐️ 新增]
         user.user_info = user.user_info_json ? JSON.parse(user.user_info_json) : null;
     }
     return user;
@@ -53,16 +54,16 @@ async function dbConfigGet(key, env) {
     
     // 构造 SQL 语句
     const fields = Object.keys(data).map(key => {
-        // 特殊处理 is_blocked (布尔值) 和 block_count (数字)
-        if (key === 'is_blocked' && typeof data[key] === 'boolean') {
-             return 'is_blocked = ?'; // D1 存储 0/1
+        // [⭐️ 修改] 特殊处理 is_blocked 和 is_muted (布尔值)
+        if ((key === 'is_blocked' || key === 'is_muted') && typeof data[key] === 'boolean') {
+             return `${key} = ?`; // D1 存储 0/1
         }
         return `${key} = ?`;
     }).join(', ');
     
     // 构造值数组
     const values = Object.keys(data).map(key => {
-         if (key === 'is_blocked' && typeof data[key] === 'boolean') {
+         if ((key === 'is_blocked' || key === 'is_muted') && typeof data[key] === 'boolean') {
              return data[key] ? 1 : 0;
          }
          return data[key];
@@ -142,11 +143,13 @@ async function dbConfigGet(key, env) {
     `;
   
     // users 表 (存储用户状态、话题ID、屏蔽状态和用户信息)
+    // [⭐️ 修改] 确保 SQL 定义包含 is_muted (用于新安装)
     const usersTableQuery = `
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY NOT NULL,
             user_state TEXT NOT NULL DEFAULT 'new',
             is_blocked INTEGER NOT NULL DEFAULT 0,
+            is_muted INTEGER NOT NULL DEFAULT 0,
             block_count INTEGER NOT NULL DEFAULT 0,
             topic_id TEXT,
             user_info_json TEXT 
@@ -171,7 +174,14 @@ async function dbConfigGet(key, env) {
             env.TG_BOT_DB.prepare(usersTableQuery),
             env.TG_BOT_DB.prepare(messagesTableQuery),
         ]);
-        // console.log("D1 Migration successful/already complete.");
+        
+        // [⭐️ 新增] 自动迁移：尝试为旧表添加 is_muted 字段
+        try {
+             await env.TG_BOT_DB.prepare("ALTER TABLE users ADD COLUMN is_muted INTEGER DEFAULT 0").run();
+        } catch (e) {
+             // 如果字段已存在会报错，忽略即可
+        }
+
     } catch (e) {
         console.error("D1 Migration Failed:", e);
         throw new Error(`D1 Initialization Failed: ${e.message}`);
@@ -220,37 +230,41 @@ async function dbConfigGet(key, env) {
   
     const timestamp = initialTimestamp ? new Date(initialTimestamp * 1000).toLocaleString('zh-CN') : new Date().toLocaleString('zh-CN');
     
-    // --- [ ⭐️ 已还原 ⭐️ ] ---
     // 还原为原始代码，不再尝试将文本设为链接
     const infoCard = `
   <b>👤 用户资料卡</b>
   • 用户名: <code>${safeUsername}</code>
   • ID: <code>${safeUserId}</code>
     `.trim();
-    // --- [ ⭐️ 还原结束 ⭐️ ] ---
   
     return { userId, name: rawName, username: rawUsername, topicName, infoCard };
   }
   
 /**
-  * 生成用户资料卡下方的操作按钮（屏蔽/解禁/置顶）
+  * [⭐️ 修改] 生成用户资料卡下方的操作按钮（屏蔽/解禁/置顶/静音）
   */
-function getInfoCardButtons(userId, isBlocked) {
+function getInfoCardButtons(userId, isBlocked, isMuted) {
     const blockAction = isBlocked ? "unblock" : "block";
     const blockText = isBlocked ? "✅ 解除屏蔽" : "🚫 屏蔽此人";
+    
+    // [⭐️ 新增] 静音按钮逻辑
+    const muteAction = isMuted ? "unmute" : "mute";
+    const muteText = isMuted ? "🔔 解除静音" : "🔕 静音通知";
+
     return {
         inline_keyboard: [
-            [{ // Row 1: Block/Unblock Button
+            [{ // Row 1: Block + Mute (并排)
                 text: blockText,
                 callback_data: `${blockAction}:${userId}`
+            }, {
+                text: muteText,
+                callback_data: `${muteAction}:${userId}`
             }],
-            // --- [ ⭐️ 新增按钮 ⭐️ ] ---
-            [{ // Row 2: View Profile Button (使用 url 属性)
+            [{ // Row 2: View Profile Button
                 text: "👤 查看用户资料",
                 url: `tg://user?id=${userId}` 
             }],
-            // --- [ ⭐️ 新增结束 ⭐️ ] ---
-            [{ // Row 3: Pin Button (原 Row 2)
+            [{ // Row 3: Pin Button
                 text: "📌 置顶此消息",
                 callback_data: `pin_card:${userId}` 
             }]
@@ -258,6 +272,32 @@ function getInfoCardButtons(userId, isBlocked) {
     };
   }
   
+/**
+ * [新增] 确保存在一个用于汇总用户资料卡的话题
+ */
+async function ensureLogTopicExists(env) {
+  const logTopicKey = 'user_profile_log_topic_id';
+  // 1. 尝试从配置中获取已存在的汇总话题 ID
+  let logTopicId = await dbConfigGet(logTopicKey, env);
+
+  // 2. 如果没有，创建一个新的
+  if (!logTopicId) {
+      try {
+          const topic = await telegramApi(env.BOT_TOKEN, "createForumTopic", {
+              chat_id: env.ADMIN_GROUP_ID,
+              name: "📋 用户资料卡汇总 (User Logs)",
+              icon_custom_emoji_id: null // 可选：设置图标
+          });
+          logTopicId = topic.message_thread_id.toString();
+          // 保存到 D1 配置中，避免重复创建
+          await dbConfigPut(logTopicKey, logTopicId, env);
+      } catch (e) {
+          console.error("创建汇总话题失败:", e);
+          return null; // 创建失败返回 null
+      }
+  }
+  return logTopicId;
+}
   
   /**
   * 优先从 D1 获取配置，其次从环境变量获取，最后使用默认值。
@@ -1371,15 +1411,17 @@ function getInfoCardButtons(userId, isBlocked) {
     }
   }
   
-  async function handleRelayToTopic(message, user, env) { // 接收 user 对象
+async function handleRelayToTopic(message, user, env) { // 接收 user 对象
     const { from: userDetails, date } = message;
     const { userId, topicName, infoCard } = getUserInfo(userDetails, date);
     let topicId = user.topic_id;
     const isBlocked = user.is_blocked;
+    const isMuted = user.is_muted || false; // [⭐️ 新增] 获取静音状态
   
     // Helper: 创建新话题并发送信息卡
     const createTopicForUser = async () => {
         try {
+            // 1. 创建用户专属话题
             const newTopic = await telegramApi(env.BOT_TOKEN, "createForumTopic", {
                 chat_id: env.ADMIN_GROUP_ID,
                 name: topicName,
@@ -1388,15 +1430,16 @@ function getInfoCardButtons(userId, isBlocked) {
             const { name, username } = getUserInfo(userDetails, date);
             const newInfo = { name, username, first_message_date: date };
   
-            // 1. 存储新的 topic_id, user_info, 和 block_count (如果是 Verified 用户)
+            // 2. 存储新的 topic_id, user_info
             await dbUserUpdate(userId, { 
                 topic_id: newTopicId, 
                 user_info_json: JSON.stringify(newInfo), 
-                block_count: 0, // 只要成功发消息，计数就清零
+                block_count: 0, 
             }, env);
   
-            // 2. 发送用户资料卡到话题 (带屏蔽/解禁按钮)
-            const cardMarkup = getInfoCardButtons(userId, isBlocked);
+            // 3. 发送用户资料卡到【用户专属话题】
+            // [⭐️ 修改] 传入 isMuted 生成按钮
+            const cardMarkup = getInfoCardButtons(userId, isBlocked, isMuted);
             await telegramApi(env.BOT_TOKEN, "sendMessage", {
                 chat_id: env.ADMIN_GROUP_ID,
                 message_thread_id: newTopicId,
@@ -1404,6 +1447,64 @@ function getInfoCardButtons(userId, isBlocked) {
                 parse_mode: "HTML",
                 reply_markup: cardMarkup,
             });
+
+// --- [ ⭐️ 汇总话题逻辑 (智能修复版) ⭐️ ] ---
+try {
+    // 1. 尝试获取或创建话题 ID
+    let logTopicId = await ensureLogTopicExists(env);
+    
+    if (logTopicId) {
+        const cleanGroupId = env.ADMIN_GROUP_ID.toString().replace(/^-100/, '');
+        const jumpUrl = `https://t.me/c/${cleanGroupId}/${newTopicId}`;
+
+        const logMarkup = JSON.parse(JSON.stringify(cardMarkup));
+        logMarkup.inline_keyboard.push([{ 
+            text: "💬 跳转到会话窗口", 
+            url: jumpUrl 
+        }]);
+
+        const logText = `<b>#新用户连接</b>\n话题ID: <code>${newTopicId}</code>\n\n${infoCard}`;
+        
+        const sendParams = {
+            chat_id: env.ADMIN_GROUP_ID,
+            message_thread_id: logTopicId,
+            text: logText,
+            parse_mode: "HTML",
+            reply_markup: logMarkup 
+        };
+
+        // 2. 尝试发送消息
+        try {
+            await telegramApi(env.BOT_TOKEN, "sendMessage", sendParams);
+        } catch (sendErr) {
+            // 3. 捕获错误：如果话题不存在 (message thread not found)
+            const errStr = sendErr.message || sendErr.toString();
+            if (errStr.includes("thread not found") || errStr.includes("TOPIC_DELETED") || errStr.includes("Bad Request: message thread not found")) {
+                console.warn("汇总话题失效，正在重建...");
+                
+                // A. 从数据库删除旧的无效 ID
+                await env.TG_BOT_DB.prepare("DELETE FROM config WHERE key = ?").bind('user_profile_log_topic_id').run();
+                
+                // B. 重新调用创建函数 (此时数据库无记录，会强制新建)
+                logTopicId = await ensureLogTopicExists(env);
+                
+                // C. 更新参数并重试发送
+                if (logTopicId) {
+                    sendParams.message_thread_id = logTopicId;
+                    await telegramApi(env.BOT_TOKEN, "sendMessage", sendParams);
+                    console.log("汇总话题已重建并发送成功");
+                }
+            } else {
+                // 如果是其他错误，抛出异常
+                throw sendErr;
+            }
+        }
+    }
+} catch (logErr) {
+    console.error("发送资料卡到汇总话题失败:", logErr);
+}
+// --- [ ⭐️ 优化结束 ⭐️ ] ---
+
             return newTopicId;
         } catch (e) {
             console.error("创建话题失败:", e?.message || e);
@@ -1418,12 +1519,9 @@ function getInfoCardButtons(userId, isBlocked) {
             message_thread_id: targetTopicId,
             from_chat_id: userId,
             message_id: message.message_id,
-            disable_notification: isBlocked, // 屏蔽用户静音
+            // [⭐️ 修改] 如果被屏蔽或被静音，则静默发送
+            disable_notification: isBlocked || isMuted, 
         });
-        
-        // 话题名更新逻辑 (如果需要)
-        // ...
-  
         return copyResult.message_id.toString();
     };
   
@@ -1444,33 +1542,27 @@ function getInfoCardButtons(userId, isBlocked) {
     try {
         const adminMessageId = await tryCopyToTopic(topicId);
   
-        // *** FIX: 存储用户消息原始内容到 messages 表 (用于跟踪用户编辑) ***
-        // KEY: 用户 ID + 用户私聊中的消息 ID
+        // 存储用户消息原始内容
         if (message.text || message.caption) {
             const messageData = { 
                 text: message.text || message.caption || '', 
                 date: message.date 
             };
-            // message.message_id 是用户私聊中的消息 ID，这是 handleRelayEditedMessage 查找的 ID
             await dbMessageDataPut(userId, message.message_id.toString(), messageData, env); 
         }
   
     } catch (e) {
-        // 出错：可能话题被删除或无效，清理 D1 并尝试重建话题一次
+        // 出错处理：尝试重建话题
         try {
-            // 删除旧的 topic_id 映射
             await dbUserUpdate(userId, { topic_id: null }, env); 
-            // 重新创建话题并把消息复制到新话题
             const newTopicId = await createTopicForUser();
             try {
                 const adminMessageId = await tryCopyToTopic(newTopicId);
-                 // 重新存储新消息的原始内容
                 if (message.text || message.caption) {
                     const messageData = { 
                         text: message.text || message.caption || '', 
                         date: message.date 
                     };
-                    // *** FIX: 存储的 key 必须是：用户 ID + 用户私聊中的消息 ID ***
                     await dbMessageDataPut(userId, message.message_id.toString(), messageData, env); 
                 }
             } catch (e2) {
@@ -1485,13 +1577,10 @@ function getInfoCardButtons(userId, isBlocked) {
         }
     }
   
-    // --- [新增] 消息备份转发逻辑 (合并为一条消息) ---
+    // --- 消息备份转发逻辑 (保持不变) ---
     const backupGroupId = await getConfig('backup_group_id', env, "");
     if (backupGroupId) {
-        // 提取用户资料，用于生成备份消息的标题
         const userInfo = getUserInfo(message.from, user.date);
-        // 生成包含发送者信息的标题 (HTML 格式)
-        // 注意：在纯文本或媒体配文前添加两行空行分隔
         const fromUserHeader = ` 
   <b>--- 备份消息 ---</b>
   👤 <b>来自用户:</b> <a href="tg://user?id=${userInfo.userId}">${userInfo.name || '无昵称'}</a> • ID: <code>${userInfo.userId}</code> • 用户名: ${userInfo.username} 
@@ -1500,73 +1589,38 @@ function getInfoCardButtons(userId, isBlocked) {
         
         const backupParams = {
             chat_id: backupGroupId,
-            disable_notification: true, // 禁用通知
+            disable_notification: true, 
             parse_mode: "HTML",
         };
   
         try {
-            // 1. 尝试处理纯文本消息 (直接合并发送)
             if (message.text) {
                 const combinedText = fromUserHeader + message.text;
-                await telegramApi(env.BOT_TOKEN, "sendMessage", {
-                    ...backupParams,
-                    text: combinedText,
-                });
+                await telegramApi(env.BOT_TOKEN, "sendMessage", { ...backupParams, text: combinedText, });
                 return;
             }
-            
-            // 2. 尝试处理带 caption 的媒体文件 (直接合并发送)
             if (message.caption) {
                 const combinedCaption = fromUserHeader + message.caption;
-                // 找到第一个媒体类型
-                if (message.photo) {
-                    await telegramApi(env.BOT_TOKEN, "sendPhoto", { ...backupParams, photo: message.photo[message.photo.length - 1].file_id, caption: combinedCaption });
-                } else if (message.video) {
-                    await telegramApi(env.BOT_TOKEN, "sendVideo", { ...backupParams, video: message.video.file_id, caption: combinedCaption });
-                } else if (message.document) {
-                    await telegramApi(env.BOT_TOKEN, "sendDocument", { ...backupParams, document: message.document.file_id, caption: combinedCaption });
-                } else if (message.audio) {
-                    await telegramApi(env.BOT_TOKEN, "sendAudio", { ...backupParams, audio: message.audio.file_id, caption: combinedCaption });
-                } else if (message.voice) {
-                    await telegramApi(env.BOT_TOKEN, "sendVoice", { ...backupParams, voice: message.voice.file_id, caption: combinedCaption });
-                } else if (message.animation) {
-                    await telegramApi(env.BOT_TOKEN, "sendAnimation", { ...backupParams, animation: message.animation.file_id, caption: combinedCaption });
-                } else if (message.sticker) {
-                    // 贴纸没有 caption 字段，但为了通用性，保留在媒体检查内
-                    await telegramApi(env.BOT_TOKEN, "sendSticker", { ...backupParams, sticker: message.sticker.file_id });
-                    return; // Sticker 成功发送后退出
-                } else {
-                    // 其他无法合并的复杂内容，走回退逻辑
-                    throw new Error("Complex media type requiring fallback copy."); 
-                }
-                return; // 成功发送带 Caption 的媒体后退出
+                if (message.photo) { await telegramApi(env.BOT_TOKEN, "sendPhoto", { ...backupParams, photo: message.photo[message.photo.length - 1].file_id, caption: combinedCaption }); } 
+                else if (message.video) { await telegramApi(env.BOT_TOKEN, "sendVideo", { ...backupParams, video: message.video.file_id, caption: combinedCaption }); } 
+                else if (message.document) { await telegramApi(env.BOT_TOKEN, "sendDocument", { ...backupParams, document: message.document.file_id, caption: combinedCaption }); } 
+                else if (message.audio) { await telegramApi(env.BOT_TOKEN, "sendAudio", { ...backupParams, audio: message.audio.file_id, caption: combinedCaption }); } 
+                else if (message.voice) { await telegramApi(env.BOT_TOKEN, "sendVoice", { ...backupParams, voice: message.voice.file_id, caption: combinedCaption }); } 
+                else if (message.animation) { await telegramApi(env.BOT_TOKEN, "sendAnimation", { ...backupParams, animation: message.animation.file_id, caption: combinedCaption }); } 
+                else if (message.sticker) { await telegramApi(env.BOT_TOKEN, "sendSticker", { ...backupParams, sticker: message.sticker.file_id }); return; } 
+                else { throw new Error("Complex media type requiring fallback copy."); }
+                return; 
             }
-  
-            // 3. 处理没有 Caption 的媒体和复杂内容 (使用 copyMessage)
             if (message.photo || message.video || message.document || message.audio || message.voice || message.sticker || message.animation || message.forward_from_chat || message.forward_from || message.contact || message.location || message.venue || message.invoice) {
-                // 无法合并到一条消息，退回到发送两条消息的方案 (头部 + 原始消息内容)
-                // 发送头部
-                await telegramApi(env.BOT_TOKEN, "sendMessage", { 
-                    ...backupParams, 
-                    text: fromUserHeader.trim(), // 只发送标题
-                    parse_mode: "HTML",
-                });
-                // 复制原始消息
-                await telegramApi(env.BOT_TOKEN, "copyMessage", {
-                    chat_id: backupGroupId,
-                    from_chat_id: userId,
-                    message_id: message.message_id,
-                });
-                return; // 复杂内容已处理，退出
+                await telegramApi(env.BOT_TOKEN, "sendMessage", { ...backupParams, text: fromUserHeader.trim(), parse_mode: "HTML", });
+                await telegramApi(env.BOT_TOKEN, "copyMessage", { chat_id: backupGroupId, from_chat_id: userId, message_id: message.message_id, });
+                return;
             }
-  
         } catch (e) {
             console.error("消息备份转发失败:", e?.message || e);
-            // 备份功能失败不应该影响主要转发流程，仅记录错误。
         }
     }
-    // --- [新增] 消息备份转发逻辑结束 ---
-  }
+}
   
   /**
   * 处理用户在私聊中修改消息的逻辑。
@@ -1735,7 +1789,7 @@ function getInfoCardButtons(userId, isBlocked) {
   }
   
   
-  // --- 回调查询处理函数 (部分代码省略，仅保留结构) ---
+  // --- 回调查询处理函数 ---
   
   async function handleCallbackQuery(callbackQuery, env) {
     const chatId = callbackQuery.from.id.toString();
@@ -1745,7 +1799,6 @@ function getInfoCardButtons(userId, isBlocked) {
     // 确保是主管理员或授权协管员，以处理管理菜单相关的回调
     const isAdmin = await isAdminUser(chatId, env);
     if (!isAdmin) {
-        // ... (非管理员的回调处理，如忽略)
         await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callbackQuery.id, text: "您无权操作此菜单。", show_alert: true });
         return;
     }
@@ -1866,7 +1919,7 @@ function getInfoCardButtons(userId, isBlocked) {
         return;
     } 
   
-    // 非配置相关的操作（屏蔽/置顶）
+    // 非配置相关的操作（屏蔽/置顶/静音）
     if (message.chat.id.toString() !== env.ADMIN_GROUP_ID) {
         return;
     }
@@ -1886,8 +1939,8 @@ function getInfoCardButtons(userId, isBlocked) {
           const user = await dbUserGetOrCreate(userId, env);
           const userName = user.user_info.name || userId;
 
-          // 1. 更新信息卡按钮
-          const newMarkup = getInfoCardButtons(userId, isBlocking);
+          // 1. 更新信息卡按钮 [⭐️ 修改] 传入 is_muted
+          const newMarkup = getInfoCardButtons(userId, isBlocking, user.is_muted);
           await telegramApi(env.BOT_TOKEN, "editMessageReplyMarkup", {
               chat_id: message.chat.id,
               message_id: message.message_id,
@@ -1909,7 +1962,48 @@ function getInfoCardButtons(userId, isBlocked) {
           console.error(`处理 ${action} 操作失败:`, e.message);
       }
   } 
-  // 2. 置顶操作
+  // 2. [⭐️ 新增] 静音/解除静音操作
+  else if (action === 'mute' || action === 'unmute') {
+      try {
+          const isMuting = action === 'mute';
+          await dbUserUpdate(userId, { is_muted: isMuting }, env);
+          
+          const user = await dbUserGetOrCreate(userId, env);
+          
+          // 更新按钮状态
+          const newMarkup = getInfoCardButtons(userId, user.is_blocked, isMuting);
+          
+          // [⭐️ 特殊逻辑] 智能保留 "跳转到会话" 按钮
+          // 如果原按钮中有跳转链接（即在汇总话题中），我们需要手动把它加回去
+          const oldMarkup = message.reply_markup;
+          let jumpButton = null;
+          if (oldMarkup && oldMarkup.inline_keyboard) {
+              const lastRow = oldMarkup.inline_keyboard[oldMarkup.inline_keyboard.length - 1];
+              // 检查最后一行是否有 t.me/c/ 链接
+              if (lastRow && lastRow[0] && lastRow[0].url && lastRow[0].url.includes('t.me/c/')) {
+                  jumpButton = lastRow;
+              }
+          }
+          // 如果找到了跳转按钮，追加到新键盘的末尾
+          if (jumpButton) {
+              newMarkup.inline_keyboard.push(jumpButton[0]); 
+          }
+
+          await telegramApi(env.BOT_TOKEN, "editMessageReplyMarkup", {
+              chat_id: message.chat.id,
+              message_id: message.message_id,
+              reply_markup: newMarkup,
+          });
+
+          await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { 
+              callback_query_id: callbackQuery.id, 
+              text: isMuting ? "🔕 已静音该用户通知" : "🔔 已恢复该用户通知", 
+              show_alert: false 
+          });
+
+      } catch (e) { console.error(`处理 ${action} 操作失败:`, e.message); }
+  }
+  // 3. 置顶操作
   else if (action === 'pin_card') {
       try {
           await telegramApi(env.BOT_TOKEN, "pinChatMessage", {
