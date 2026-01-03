@@ -1,4 +1,4 @@
-name = "my-tg-bot01"
+name = "tgbot-d1"
 main = "TGbot-D1创新版本2.6.2.js" # 注意：这里要指向作者仓库里的文件名
 compatibility_date = "2024-01-01"
 
